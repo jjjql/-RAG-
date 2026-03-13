@@ -1,6 +1,17 @@
 核心架构图 (System Architecture)
 本项目采用分层架构，打通了从底层网络通信到上层业务应用的全链路。
-mermaid
+# Enterprise-Private-LLM-Stack 
+### 企业级私有化大模型全栈算力架构与 RAG 性能调优实践
+
+> **项目定位**：本项目专注于解决企业私有化 AI 落地中的“最后一公里”工程难题。在非 H100 集群的受限硬件环境（如 RTX 3090/4090）下，通过系统级调优实现高可用、低延迟、高准确度的私有知识库方案。
+
+---
+
+## 核心架构图 (System Architecture)
+
+本项目采用分层架构，打通了从底层网络通信到上层业务应用的全链路。
+
+```mermaid
 graph TD
     User[用户输入] --> UI[Dify/FastGPT 控制台]
     UI --> Search{混合检索路由}
@@ -21,7 +32,7 @@ graph TD
     Vector --- RoCE[RoCE v2 / RDMA 通信]
     LLM --- RoCE
     end
-请谨慎使用此类代码。
+
 
 关键技术攻坚与工程调优 (Engineering Logs)
 作为算力架构师，本项目记录了以下核心瓶颈的突破过程。我们避开了盲目的参数尝试，转而从 Transformer 底层原理出发进行针对性优化：
