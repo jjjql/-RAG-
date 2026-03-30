@@ -1,0 +1,4 @@
+# Python 3.10+（与 .cursorrules / pyproject 一致）
+pydantic>=2.6.0,<3
+fastembed>=0.3.0,<1
+pytest>=7.4.0,<9

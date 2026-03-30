@@ -1,0 +1,11 @@
+.git
+.github
+specs
+ai_service
+test
+scripts
+interface
+*.md
+.cursorrules
+gateway.exe
+**/*_test.go

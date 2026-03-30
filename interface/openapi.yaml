@@ -1,0 +1,730 @@
+openapi: 3.0.3
+info:
+  title: RAG 语义网关 — 北向 HTTP API
+  description: |
+    **用户问答** `POST /v1/qa`：响应为 **SSE**（`text/event-stream`），流内 `delta`/`done` 等事件载荷为 JSON 行。
+    **架构锁定（本期）**：用户 SSE 路径**不采用 API Key、mTLS 或 Bearer**；鉴权由**部署侧网络边界**（如内网、API 网关、零信任）负责；若未来需用户端密钥，须另开 PRD/契约版本评审。
+    **管理端**（精确 KEY/DAT、正则表达式/DAT 及 CRUD）：请求与成功响应均为 **`application/json`**，**不采用 SSE**。**本期网关进程不校验**管理端 API Key / JWT / Bearer；访问控制由**部署侧网络边界或前置网关**负责（与用户路径策略一致）；若未来在网关内实现凭证，须递增契约主版本并更新 PRD/架构文档。
+    **健康检查** `GET /v1/health`：`application/json`。
+    **产品与架构对齐（`interface/PM_PRODUCT_REVIEW.md` §0）**：精确命中 **`scope`+`key`**；**`ErrorBody.code` 中文稳定短语**；**无** `X-Config-Version`，版本走 SSE **`productVersion`**；用户 **仅 SSE**；**缺省 Accept 流类型须 406**。
+    本期仅 HTTP；gRPC 北向不纳入本期实现。映射 PRD：`specs/requirements.md`（FR-Uxx、FR-Axx）。
+  version: 0.2.3
+
+servers:
+  - url: /
+    description: 相对网关根路径（部署时可加前缀，由运维约定）
+
+tags:
+  - name: UserQA
+    description: 用户提问（FR-U01～U03），应答为 **SSE**（`text/event-stream`）
+  - name: AdminExact
+    description: 精确 KEY / DAT 配置（FR-A01）；**JSON API**（非 SSE）
+  - name: AdminRegex
+    description: 正则表达式与 DAT 配置（FR-A02）；**JSON API**（非 SSE）
+  - name: System
+    description: 健康与存活探测
+
+paths:
+  /v1/health:
+    get:
+      tags: [System]
+      summary: 存活检查
+      operationId: getHealth
+      responses:
+        "200":
+          description: 服务可用
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /v1/qa:
+    post:
+      tags: [UserQA]
+      summary: 用户提问（SSE 流式应答）
+      description: |
+        编排顺序由实现遵循架构：精确 → 正则 → 向量语义缓存 → 外部 RAG。
+
+        **传输形态**：成功时响应 `Content-Type: text/event-stream`（[Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)），字符编码 **UTF-8**。  
+        客户端须携带 `Accept: text/event-stream`；**否则服务端应返回 406**（产品与架构对齐）。
+
+        **事件约定**（每条 SSE 消息可含可选 `id:` 行，由实现决定是否启用重连）：
+        1. `event: meta`（可选，建议首条）：`data` 为 JSON，见 `SSEMetaData`（如提前下发 `traceId`）。
+        2. `event: delta`（零条或多条）：`data` 为 JSON，见 `SSEDeltaData`；字段 `text` 为**增量**可见文本片段，客户端按顺序拼接为完整答案。
+        3. `event: done`（**必有且仅一条**，置于流末尾）：`data` 为 JSON，见 `SSEDoneData`；承载 `source`、`traceId`、可选 `ruleId`，与旧版一次性 JSON 应答语义对齐。
+        4. `event: error`（异常时）：`data` 为 JSON，结构同 `ErrorBody`；可在**已建立流之后**下发，随后服务端应结束流。
+
+        **规则命中 / 语义缓存**：可将完整 `DAT` 作为**单条** `delta` 发出后紧跟 `done`，以实现「快路径」仍兼容流式客户端。
+
+        **NFR 与观测**：产品承诺的 NFR-P02 统计区间仍以系统设计 §2.3 为准（交下游前）；**首条 SSE 写出时间（TTFB）** 建议作为补充指标单独观测，不替代 PRD 边界。
+
+        **注释行**：规范允许以 `:` 开头的 SSE 注释作为心跳；客户端应忽略。
+
+        **鉴权（本期）**：本操作**不要求**也不校验 **API Key / Authorization**；**不返回 401** 因缺少用户凭证（与架构锁定一致）。
+
+        **精确命中**：同时提供 **`scope` 与 `key`** 时，按 **(scope, key)** 命中精确规则；否则进入正则 / 向量 / RAG。
+      operationId: postQA
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+        - $ref: "#/components/parameters/AcceptEventStream"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QARequest"
+      responses:
+        "200":
+          description: SSE 事件流；连接保持至收到 `done` 或 `error` 后关闭（或由实现定义空闲超时）。
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+            Cache-Control:
+              description: 响应为流式事件，不得被中间缓存为普通静态资源
+              schema:
+                type: string
+                example: no-cache
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE 帧序列。每帧以 `event:` / `data:` 等行组成，以空行（`\n\n`）结束。
+                  `data` 行内为 JSON 字符串，需按 UTF-8 解析。
+              example: |
+                event: meta
+                data: {"traceId":"550e8400-e29b-41d4-a716-446655440000","productVersion":"2026.03.1"}
+
+                event: delta
+                data: {"text":"请点击"}
+
+                event: delta
+                data: {"text":"登录页「忘记密码」。"}
+
+                event: done
+                data: {"source":"rule_exact","ruleId":"123e4567-e89b-12d3-a456-426614174000","traceId":"550e8400-e29b-41d4-a716-446655440000","productVersion":"2026.03.1"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "406":
+          description: 未接受 `text/event-stream`（若实现校验 Accept）
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        default:
+          $ref: "#/components/responses/GenericError"
+
+  /v1/admin/rules/exact:
+    get:
+      tags: [AdminExact]
+      summary: 列出精确规则
+      operationId: listExactRules
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+        - name: scope
+          in: query
+          schema:
+            type: string
+          description: 可选作用域；不传则返回默认全局视图（实现定义）
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: 分页列表
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExactRuleListResponse"
+        default:
+          $ref: "#/components/responses/GenericError"
+    post:
+      tags: [AdminExact]
+      summary: 创建精确规则
+      operationId: createExactRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExactRuleCreate"
+      responses:
+        "201":
+          description: 已创建
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExactRule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: 同 scope 下 KEY 冲突（FR-A01）
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        default:
+          $ref: "#/components/responses/GenericError"
+
+  /v1/admin/rules/exact/{ruleId}:
+    parameters:
+      - $ref: "#/components/parameters/RuleId"
+    get:
+      tags: [AdminExact]
+      summary: 获取精确规则详情
+      operationId: getExactRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      responses:
+        "200":
+          description: 详情
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExactRule"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/GenericError"
+    patch:
+      tags: [AdminExact]
+      summary: 更新精确规则（部分字段）
+      operationId: patchExactRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExactRulePatch"
+      responses:
+        "200":
+          description: 已更新
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExactRule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: KEY 冲突
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        default:
+          $ref: "#/components/responses/GenericError"
+    delete:
+      tags: [AdminExact]
+      summary: 删除精确规则
+      operationId: deleteExactRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      responses:
+        "204":
+          description: 已删除
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/GenericError"
+
+  /v1/admin/rules/regex:
+    get:
+      tags: [AdminRegex]
+      summary: 列出正则规则
+      operationId: listRegexRules
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+        - name: scope
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: 分页列表
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegexRuleListResponse"
+        default:
+          $ref: "#/components/responses/GenericError"
+    post:
+      tags: [AdminRegex]
+      summary: 创建正则规则
+      operationId: createRegexRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegexRuleCreate"
+      responses:
+        "201":
+          description: 已创建
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegexRule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        default:
+          $ref: "#/components/responses/GenericError"
+
+  /v1/admin/rules/regex/{ruleId}:
+    parameters:
+      - $ref: "#/components/parameters/RuleId"
+    get:
+      tags: [AdminRegex]
+      summary: 获取正则规则详情
+      operationId: getRegexRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      responses:
+        "200":
+          description: 详情
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegexRule"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/GenericError"
+    patch:
+      tags: [AdminRegex]
+      summary: 更新正则规则
+      operationId: patchRegexRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegexRulePatch"
+      responses:
+        "200":
+          description: 已更新
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegexRule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/GenericError"
+    delete:
+      tags: [AdminRegex]
+      summary: 删除正则规则
+      operationId: deleteRegexRule
+      parameters:
+        - $ref: "#/components/parameters/X-Trace-Id"
+      responses:
+        "204":
+          description: 已删除
+          headers:
+            X-Trace-Id:
+              $ref: "#/components/headers/X-Trace-Id"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/GenericError"
+
+components:
+  headers:
+    X-Trace-Id:
+      description: 分布式追踪 ID；请求可传入，服务端未收到则生成，并在响应中回传。
+      schema:
+        type: string
+        format: uuid
+
+  parameters:
+    X-Trace-Id:
+      name: X-Trace-Id
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+    AcceptEventStream:
+      name: Accept
+      in: header
+      required: true
+      description: 必须为 `text/event-stream` 以接收 SSE 应答。
+      schema:
+        type: string
+        enum:
+          - text/event-stream
+    RuleId:
+      name: ruleId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: 参数非法
+      headers:
+        X-Trace-Id:
+          $ref: "#/components/headers/X-Trace-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    NotFound:
+      description: 资源不存在
+      headers:
+        X-Trace-Id:
+          $ref: "#/components/headers/X-Trace-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    ServiceUnavailable:
+      description: 依赖不可用或网关熔断（NFR-G01）
+      headers:
+        X-Trace-Id:
+          $ref: "#/components/headers/X-Trace-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    GenericError:
+      description: 其他错误
+      headers:
+        X-Trace-Id:
+          $ref: "#/components/headers/X-Trace-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    QARequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: 用户自然语言问题（FR-U01）；用于正则 / 语义缓存 / RAG
+          minLength: 1
+          maxLength: 8192
+        key:
+          type: string
+          description: |
+            精确规则命中键，与 `scope` 成对，对应管理端 `(scope, key)`；典型 `scope` 为一级产品线 ID。未传则不做精确键命中。
+          minLength: 1
+          maxLength: 2048
+        sessionId:
+          type: string
+          description: 可选会话 ID，透传/记录，不参与规则 KEY 匹配
+          maxLength: 128
+        scope:
+          type: string
+          description: 规则命名空间（PRD「作用域」）。精确命中须与 `key` 同时提供。未传则默认全局命名空间。
+          maxLength: 128
+
+    AnswerSource:
+      type: string
+      enum:
+        - rule_exact
+        - rule_regex
+        - semantic_cache
+        - rag
+      description: |
+        rule_exact / rule_regex：命中规则库 DAT。
+        semantic_cache：向量语义缓存（L3）命中且未调用外部 RAG。
+        rag：由外部知识/模型服务生成（FR-U03）。
+
+    SSEMetaData:
+      type: object
+      description: `event: meta` 的 `data` JSON（可选；建议首条）
+      properties:
+        traceId:
+          type: string
+          format: uuid
+          description: 与响应头 X-Trace-Id 对齐（若可提前确定）
+        productVersion:
+          type: string
+          description: 产品/业务版本（非响应头 X-Config-Version）
+          maxLength: 64
+          example: "2026.03.1"
+
+    SSEDeltaData:
+      type: object
+      required: [text]
+      description: `event: delta` 的 `data` JSON；`text` 为增量片段，多帧顺序拼接为完整可见答案。
+      properties:
+        text:
+          type: string
+          description: UTF-8 文本片段；可为空串（实现占位），客户端应跳过或追加空串
+
+    SSEDoneData:
+      type: object
+      required: [source, traceId]
+      description: `event: done` 的 `data` JSON；**流结束前必须发送一次**。
+      properties:
+        source:
+          $ref: "#/components/schemas/AnswerSource"
+        ruleId:
+          type: string
+          format: uuid
+          description: 命中规则时携带；`rag` / `semantic_cache` 等可省略
+        traceId:
+          type: string
+          format: uuid
+          description: 与响应头 X-Trace-Id 一致
+
+    QAResponse:
+      type: object
+      deprecated: true
+      description: |
+        **已弃用（v0.2.0）**：用户问答改为 SSE。逻辑上等价于：所有 `delta.text` 拼接 + `done` 中 `source`/`ruleId`/`traceId`。
+      required: [answer, source]
+      properties:
+        answer:
+          type: string
+        source:
+          $ref: "#/components/schemas/AnswerSource"
+        ruleId:
+          type: string
+          format: uuid
+        traceId:
+          type: string
+          format: uuid
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: 稳定错误标识（**中文短语文本**，供客户端分支，产品与架构对齐）
+          example: 参数无效
+        message:
+          type: string
+          description: 人类可读说明（中文为主，NFR-G01）
+          example: 请求体 JSON 字段校验失败，请检查 query 是否为空。
+        traceId:
+          type: string
+          format: uuid
+
+    ExactRuleCreate:
+      type: object
+      required: [key, dat]
+      properties:
+        scope:
+          type: string
+          maxLength: 128
+        key:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        dat:
+          type: string
+          description: 应答内容；是否允许空串由产品确认（PRD 除外条款）
+          maxLength: 65536
+
+    ExactRulePatch:
+      type: object
+      properties:
+        scope:
+          type: string
+          maxLength: 128
+        key:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        dat:
+          type: string
+          maxLength: 65536
+
+    ExactRule:
+      type: object
+      required: [id, key, dat, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+          nullable: true
+        key:
+          type: string
+        dat:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ExactRuleListResponse:
+      type: object
+      required: [items, page, pageSize, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExactRule"
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+          minimum: 0
+
+    RegexRuleCreate:
+      type: object
+      required: [pattern, dat, priority]
+      properties:
+        scope:
+          type: string
+          maxLength: 128
+        pattern:
+          type: string
+          description: 正则表达式（FR-A02）；引擎语义见 PM 确认（RE2/PCRE）
+          minLength: 1
+          maxLength: 2048
+        dat:
+          type: string
+          maxLength: 65536
+        priority:
+          type: integer
+          description: 越大越优先；同 priority 取 updatedAt 最新（PRD）
+
+    RegexRulePatch:
+      type: object
+      properties:
+        scope:
+          type: string
+          maxLength: 128
+        pattern:
+          type: string
+          maxLength: 2048
+        dat:
+          type: string
+          maxLength: 65536
+        priority:
+          type: integer
+
+    RegexRule:
+      type: object
+      required: [id, pattern, dat, priority, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+          nullable: true
+        pattern:
+          type: string
+        dat:
+          type: string
+        priority:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    RegexRuleListResponse:
+      type: object
+      required: [items, page, pageSize, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/RegexRule"
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+          minimum: 0

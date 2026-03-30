@@ -1,0 +1,35 @@
+# 与 docker-compose.yml 合并：网关 + Redis + LangChain 契约 MOCK 容器（无 LLM）。
+# 用法（仓库根目录）：
+#   docker compose -f docker-compose.yml -f docker-compose.langchain.yml up -d --build
+# 验证：见 test/e2e/LANGCHAIN_DOCKER_MOCK.md、scripts/test_langchain_e2e.ps1
+
+services:
+  langchain-mock:
+    build:
+      context: ./langchain_mock
+      dockerfile: Dockerfile
+    ports:
+      - "1989:1989"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:1989/health\")"',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  gateway:
+    depends_on:
+      redis:
+        condition: service_healthy
+      langchain-mock:
+        condition: service_healthy
+    environment:
+      GATEWAY_REDIS_ADDR: redis:6379
+      GATEWAY_DOWNSTREAM_MODE: langchain_http
+      GATEWAY_DOWNSTREAM_HTTP_BASE_URL: http://langchain-mock:1989
+      GATEWAY_DOWNSTREAM_HTTP_PATH: /v1/rag/invoke
+      GATEWAY_DOWNSTREAM_TIMEOUT_MS: "10000"

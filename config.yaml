@@ -1,0 +1,39 @@
+# Viper 统一配置；可用环境变量覆盖，如 GATEWAY_REDIS_ADDR=redis:6379
+server:
+  http_addr: ":8080"
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+# Python 侧车 Embedding（UDS v1.0）；未启用时不连侧车，问答未命中规则直接提示下游未实现
+embedding:
+  enabled: false
+  transport: unix
+  socket_path: "/tmp/rag_gateway.sock"
+  tcp_addr: "127.0.0.1:18080"
+  timeout_ms: 100
+  ping_timeout_ms: 5000
+  # SYS-ENG-01 熔断（连续失败开路）；未启用侧车时此项不影响集成
+  circuit_breaker:
+    enabled: false
+    failure_threshold: 5
+    open_seconds: 30
+
+# 智能问答下游（FR-U01/FR-U03）。mode: mock | langchain_http
+# LangChain 契约：specs/architecture/contracts/HTTP_LANGCHAIN_DOWNSTREAM.md
+downstream:
+  enabled: true
+  mode: mock
+  mock_text: "Mock RAG 应答（集成测试）"
+  timeout_ms: 100
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    open_seconds: 30
+  # langchain_http 示例（与 mock 二选一）：
+  # http_base_url: "http://127.0.0.1:1989"
+  # http_path: "/v1/rag/invoke"
+  # http_api_key_header: "X-API-Key"
+  # http_api_key: ""   # 建议使用环境变量 GATEWAY_DOWNSTREAM_HTTP_API_KEY

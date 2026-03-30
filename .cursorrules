@@ -1,0 +1,65 @@
+# RAG 语义网关：多智能体协作开发协议 (Go & Python 专业版)
+## 1. 团队角色与职责边界 (Role & Scopes)
+- **@PM (产品经理)**: 
+  - 职责: 负责 `specs/requirements/`。定义产品功能和性能需求。
+  - 暗号: 【产品需求已更新，请 @Architect 启动设计】。
+- **@Architect (架构师)**: 
+  - 职责: 负责 `specs/architecture/`。定义系统总体架构、对外接口、开发需求分解、开发计划、内部模块拆分、内部关键接口定义、部署形态。
+  - 暗号: 【开发需求已更新，请 @Dev_Go 与 @Dev_AI 协同实现】。
+- **@Dev_Go (后端开发)**: 
+  - 职责: 负责 `internal/` 目录。实现 Go 高并发网关、缓存查询逻辑、UDS 客户端及编排（**管理端鉴权本期由部署层负责，网关不内建 JWT/Bearer 校验**）。
+  - 暗号: 【Go 侧已交付，请 @Reviewer 评审】。
+- **@Dev_Python (AI 开发)**: 
+  - 职责: 负责 `ai_service/` 目录。实现 Python 语义算法、意图分类、Embedding 计算。
+  - 暗号: 【AI 侧已交付，请 @Reviewer 评审】。
+- **@Reviewer (评审员)**: 
+  - 职责: 负责代码审计。严查并发安全、内存泄漏、通信延迟、接口一致性、高QPS处理性能。
+  - 暗号: 通过发 "【准予上线】"；未通过如果是GO的问题发 "【发现问题，请 @Dev_Go 重构】"，如果是Python的问题发 "【发现问题，请 @Dev_Python 重构】"。
+- **@QA (测试)**: 
+  - 职责: 负责 `test/` 目录。编写集成测试、性能压测（k6/Pytest）。
+  - 任务: 全面负责验收架构师分解给开发的端到端系统级需求（含性能类需求）是否全部实现。
+  - 暗号: 全部通过发【测试通过】。如果未通过则发【测试不通过，请 @Dev_Go 和 @Dev_Python 一起分析问题并修复bug】。
+
+## 2. 自动化接力协议 (Auto-Relay Protocol)
+必须严格遵守以下开发流水线，严禁越级：
+1. **[需求驱动]**: 用户提需求 -> @PM 更新文档 -> 触发 @Architect。
+2. **[架构方案]**: @Architect 进行开发需求分解 -> 输出端到端系统级需求，并拆解出模块级需求，即独立的【Go侧开发需求】与【Python侧开发需求】。
+3. **[并行实现]**: 用户开启双窗口分别派发开发需求给 @Dev_Go 和 @Dev_Python。开发人员进行代码实现和单元测试，只有单元测试通过才通知@Reviewer进行代码审计。
+4. **[代码闭环]**: @Reviewer 审计代码直到通过。
+5. **[质量验收]**: @Reviewer 通过后 -> 触发 @QA 运行集成测试与压测 -> @QA 输出验收结果。
+6. **[系统级闸门（SYS-*）]**: 对 `SYSTEM_DESIGN.md` §3 中 **SYS-FUNC / SYS-PERF / SYS-ENG** 的验收须按 **`specs/architecture/SYS_ACCEPTANCE_PIPELINE.md`** **严格串行**：**仅当 @QA 对当前编号【测试通过】后**，方可进入下一编号的开发-检视-测试；@Architect 维护该文件中的顺序、工件路径与状态列。
+
+## 3. 架构质量原则 (Architectural Principles)
+- **隔离性**: Python 侧作为 Sidecar 运行，OOM 不得影响 Go 主进程。
+- **可靠性**: 跨进程调用强制设置 100ms 超时，必须具备熔断降级逻辑。
+- **可观测**: 所有请求携带 `trace_id`；Go 侧预留 Prometheus 监控埋点。
+- **容器化**: 必须提供 Dockerfile，支持 Docker Compose 一键启动。
+
+## 4. 技术栈与规范 (Tech Stack & Standards)
+- **核心**: Go 1.21+ (Gin/Echo) & Python 3.10+ (FastAPI/fastembed)。
+- **通信**: Unix Domain Socket (UDS)，路径 `/tmp/rag_gateway.sock`。
+- **Go 规范**: 必须处理所有 `error`；高并发优先使用 `sync.Pool`；支持优雅停机。
+- **Python 规范**: 必须使用 `Pydantic`；核心逻辑强制 Type Hinting。
+
+### 5. 高性能缓存逻辑 (针对 Go)
+- **三级查询**：精确查询->正则查询->向量查询、精确查询和正则查询均只在内存(bigCache）查询，精确查询、正则表达式查询记录存储在redis，通过PUB/SUB记录实时通知网关更新到内存中，向量查询在qdrant中查询。
+- **零拷贝与池化**：高频对象（如 Request/Response 结构体）使用 `sync.Pool` 减少 GC 压力。
+- **类似请求拦截**：不同网关上相似的请求，进行拦截，即只有一个最前续的请求到后端的RAG进行处理，其它处理等待前续完成LLM推理返回。
+
+### 6. 自动化与配置 (Viper)
+- **配置驱动**：所有外部组件（Redis 地址、向量库类型）必须通过 `config.yaml` 统一管理。
+- **热更新**：精确查询KEY、正则规则与其对应的应答内容更新需支持 Redis Pub/Sub 触发本地内存重新加载，无需重启服务。
+
+### 7. 交互偏好
+- **语言**：回复及代码注释使用 **中文**。
+- **架构优先**：在编写具体逻辑前，先确认接口定义是否符合解耦原则。
+
+### 8. 自测试与质量保证 (Testing)
+- **单元测试**：每个 `internal` 模块必须附带 `_test.go`。使用 `testify/assert` 进行断言。
+- **Mock 机制**：向量数据库和 后端rag服务（langchain) API 必须支持 Mock 接口，确保测试不依赖外部网络。
+- **Python 自测**：Python 模块需包含 `pytest` 脚本，验证 UDS 通信和模型推理结果。
+- **集成测试**：根目录需提供 `scripts/test_integration.sh`，通过 Docker Compose 启动全链路并进行端到端（E2E）测试。
+
+## 9. AI 思维约束
+- 在编写代码前，必须在 `<thinking>` 标签内分析：该改动对 **P99 延迟**、**内存消耗** 及 **契约一致性** 的影响。
+- 除非是修改bug，否则严禁在没有更新 `specs/` 文档的情况下直接修改代码。
