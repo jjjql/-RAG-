@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -13,12 +14,14 @@ import (
 
 	"rag-gateway/internal/bootstrap"
 	"rag-gateway/internal/circuitbreaker"
+	"rag-gateway/internal/coalesce"
 	"rag-gateway/internal/config"
 	"rag-gateway/internal/downstream"
 	"rag-gateway/internal/embedding"
 	httpnb "rag-gateway/internal/northbound/http"
 	_ "rag-gateway/internal/observability" // Prometheus 指标注册（/metrics）
 	"rag-gateway/internal/rules"
+	"rag-gateway/internal/vector"
 )
 
 func main() {
@@ -114,8 +117,14 @@ func main() {
 		var ans downstream.Answerer
 		switch mode {
 		case "mock":
-			ans = downstream.NewMock(cfg.Downstream.MockText)
-			log.Printf("智能问答下游 mock（timeout=%v）", to)
+			m := downstream.NewMock(cfg.Downstream.MockText)
+			if d := cfg.Downstream.MockDelayMS; d > 0 {
+				m.Delay = time.Duration(d) * time.Millisecond
+				log.Printf("智能问答下游 mock（timeout=%v，mock_delay_ms=%d 用于故障注入）", to, d)
+			} else {
+				log.Printf("智能问答下游 mock（timeout=%v）", to)
+			}
+			ans = m
 		case "langchain_http":
 			base := strings.TrimSpace(cfg.Downstream.HTTPBaseURL)
 			if base == "" {
@@ -147,11 +156,164 @@ func main() {
 		}
 	}
 
+	var vecStore vector.Store = vector.Noop{}
+	var dedupSearch vector.Store
+	var dedupWriter vector.AnswerWriter
+	vectorEnabled := cfg.Vector.Enabled
+	if cfg.Vector.Enabled {
+		vm := strings.TrimSpace(strings.ToLower(cfg.Vector.Mode))
+		if vm == "" {
+			vm = "noop"
+		}
+		vto := time.Duration(cfg.Vector.TimeoutMS) * time.Millisecond
+		if vto <= 0 {
+			vto = 100 * time.Millisecond
+		}
+		switch vm {
+		case "qdrant":
+			base := strings.TrimSpace(cfg.Vector.Qdrant.URL)
+			coll := strings.TrimSpace(cfg.Vector.Qdrant.Collection)
+			if base == "" || coll == "" {
+				log.Fatal("vector.enabled=true 且 mode=qdrant 须配置 vector.qdrant.url 与 vector.qdrant.collection")
+			}
+			th := cfg.Vector.ScoreThreshold
+			q := vector.NewQdrant(vector.QdrantConfig{
+				BaseURL:        base,
+				Collection:     coll,
+				APIKey:         strings.TrimSpace(cfg.Vector.Qdrant.APIKey),
+				ScoreThreshold: th,
+				HTTPClient:     &http.Client{Timeout: vto},
+			})
+			var vbr *circuitbreaker.Breaker
+			if cfg.Vector.CircuitBreaker.Enabled {
+				vbr = newBreakerFromCfg(cfg.Vector.CircuitBreaker)
+			}
+			vecStore = vector.NewCircuitStore(q, vbr, vto)
+			log.Printf("向量检索 Qdrant（timeout=%v，熔断=%v）", vto, cfg.Vector.CircuitBreaker.Enabled)
+		default:
+			vecStore = vector.Noop{}
+			log.Printf("向量 mode=%q 使用 noop", vm)
+		}
+	}
+
+	if cfg.Vector.SemanticDedup.Enabled {
+		if !cfg.Embedding.Enabled {
+			log.Fatal("vector.semantic_dedup.enabled=true 须同时 embedding.enabled=true")
+		}
+		vm := strings.TrimSpace(strings.ToLower(cfg.Vector.Mode))
+		if !cfg.Vector.Enabled || vm != "qdrant" {
+			log.Fatal("vector.semantic_dedup 仅支持 vector.enabled=true 且 mode=qdrant")
+		}
+		vto := time.Duration(cfg.Vector.TimeoutMS) * time.Millisecond
+		if vto <= 0 {
+			vto = 100 * time.Millisecond
+		}
+		base := strings.TrimSpace(cfg.Vector.Qdrant.URL)
+		primaryColl := strings.TrimSpace(cfg.Vector.Qdrant.Collection)
+		if base == "" || primaryColl == "" {
+			log.Fatal("semantic_dedup 需要有效的 vector.qdrant.url 与 collection")
+		}
+		dedupColl := strings.TrimSpace(cfg.Vector.SemanticDedup.Collection)
+		dedupTh := cfg.Vector.SemanticDedup.ScoreThreshold
+		if dedupTh <= 0 {
+			dedupTh = cfg.Vector.ScoreThreshold
+		}
+		var vbr *circuitbreaker.Breaker
+		if cfg.Vector.CircuitBreaker.Enabled {
+			vbr = newBreakerFromCfg(cfg.Vector.CircuitBreaker)
+		}
+		writeColl := primaryColl
+		if dedupColl != "" {
+			writeColl = dedupColl
+		}
+		qWrite := vector.NewQdrant(vector.QdrantConfig{
+			BaseURL:        base,
+			Collection:     writeColl,
+			APIKey:         strings.TrimSpace(cfg.Vector.Qdrant.APIKey),
+			ScoreThreshold: dedupTh,
+			HTTPClient:     &http.Client{Timeout: vto},
+		})
+		dedupWriter = &vector.TimeoutUpserter{Inner: qWrite, Timeout: 3 * time.Second}
+		log.Printf("持久化语义去重：写回 collection=%s（wait=true upsert）", writeColl)
+		if dedupColl != "" && !strings.EqualFold(dedupColl, primaryColl) {
+			qDedup := vector.NewQdrant(vector.QdrantConfig{
+				BaseURL:        base,
+				Collection:     dedupColl,
+				APIKey:         strings.TrimSpace(cfg.Vector.Qdrant.APIKey),
+				ScoreThreshold: dedupTh,
+				HTTPClient:     &http.Client{Timeout: vto},
+			})
+			dedupSearch = vector.NewCircuitStore(qDedup, vbr, vto)
+			log.Printf("持久化语义去重：独立检索集合 %s（阈值=%v）", dedupColl, dedupTh)
+		}
+	}
+
+	var sem coalesce.Semantic
+	merger := coalesce.Merger(coalesce.Passthrough{})
+	if cfg.Coalesce.Enabled {
+		mergeTO := time.Duration(cfg.Downstream.TimeoutMS) * time.Millisecond
+		if mergeTO <= 0 {
+			mergeTO = 100 * time.Millisecond
+		}
+		mode := strings.TrimSpace(strings.ToLower(cfg.Coalesce.Mode))
+		if mode == "" {
+			mode = "local"
+		}
+		var redisCfg coalesce.RedisConfig
+		switch mode {
+		case "redis":
+			lockTTL := time.Duration(cfg.Coalesce.LockTTLSeconds) * time.Second
+			if lockTTL <= 0 {
+				lockTTL = 120 * time.Second
+			}
+			resTTL := time.Duration(cfg.Coalesce.ResultTTLSeconds) * time.Second
+			if resTTL <= 0 {
+				resTTL = 90 * time.Second
+			}
+			redisCfg = coalesce.RedisConfig{
+				MergeTimeout: mergeTO,
+				LockTTL:      lockTTL,
+				ResultTTL:    resTTL,
+			}
+			merger = coalesce.NewRedis(rdb, redisCfg)
+			log.Printf("相似请求合并 coalesce=redis（MergeTimeout=%v，lock=%v，resultTTL=%v）", mergeTO, lockTTL, resTTL)
+		default:
+			merger = &coalesce.RAG{Enabled: true, MergeTimeout: mergeTO}
+			log.Printf("相似请求合并 coalesce=local（MergeTimeout=%v，键=scope+规范化query）", mergeTO)
+		}
+		if cfg.Coalesce.Semantic {
+			if embedSvc == nil {
+				log.Fatal("coalesce.semantic=true 时必须启用 embedding.enabled 并提供侧车")
+			}
+			th := cfg.Coalesce.SimilarityThreshold
+			if th <= 0 {
+				th = 0.95
+			}
+			maxA := cfg.Coalesce.SemanticMaxActive
+			if maxA <= 0 {
+				maxA = 256
+			}
+			if mode == "redis" {
+				sem = coalesce.NewSemanticRedis(rdb, redisCfg, th, maxA)
+				log.Printf("语义相似合并 semantic=redis（threshold=%v，maxActive=%d）", th, maxA)
+			} else {
+				sem = coalesce.NewSemanticLocal(mergeTO, th)
+				log.Printf("语义相似合并 semantic=local（threshold=%v）", th)
+			}
+		}
+	}
+
 	deps := &httpnb.Deps{
-		Exact:      coord,
-		Regex:      regexCoord,
-		Embedder:   embedSvc,
-		Downstream: rag,
+		Exact:         coord,
+		Regex:         regexCoord,
+		Embedder:      embedSvc,
+		Downstream:    rag,
+		Coalesce:      merger,
+		Semantic:      sem,
+		VectorEnabled: vectorEnabled,
+		Vector:        vecStore,
+		DedupVector:   dedupSearch,
+		DedupWriter:   dedupWriter,
 	}
 
 	handler := httpnb.NewHandler(deps)

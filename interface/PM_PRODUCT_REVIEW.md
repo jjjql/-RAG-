@@ -25,7 +25,7 @@
 | 1.1 | **用户鉴权** | **架构已锁定（本期）**：北向 **SSE** **不使用 API Key / mTLS / Bearer**；依赖部署网络边界。 | **已锁定**（同 PRD §1.3） |
 | 1.2 | **作用域 `scope` + 精确键 `key`** | 精确规则按 **`scope` + `key`** 与管理端一致；`scope` 典型为一级产品线 ID；未传 `key` 则不做精确键命中。 | **已对齐** |
 | 1.3 | **会话 `sessionId`** | 可选，透传/记录，**不参与**规则 KEY 匹配。 | **已对齐**：**可选即可** |
-| 1.4 | **应答来源 `source`** | `event:done`：`rule_exact` / `rule_regex` / `semantic_cache` / `rag`。 | **已对齐**：与对外话术一致；**「智能问答」仅对应 `rag`**；`semantic_cache` 为语义缓存命中 |
+| 1.4 | **应答来源 `source`** | `event:done`：`rule_exact` / `rule_regex` / `semantic_cache` / **`semantic_dedup`** / `rag`（OpenAPI **0.2.4+**）。 | **已对齐**：**「智能问答」仅对应 `rag`**；`semantic_cache` 为预置语义缓存；**`semantic_dedup`** 为持久化语义去重命中（FR-U04） |
 | 1.5 | **答案形态** | `delta.text` 顺序拼接；DAT 可为 JSON 文本由业务解析。 | **已对齐**：**本期仅纯文本增量**；**不要** citations 等额外 SSE 事件（下版另立项） |
 | 1.6 | **错误与前置失败** | HTTP 4xx/5xx + JSON；流内可 `event:error`。 | **已对齐**：**接受** |
 | 1.7 | **Accept 与 406** | 契约要求 `Accept: text/event-stream`。 | **已对齐**：**须返回 406**（缺省或非流 Accept 时） |

@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"rag-gateway/internal/circuitbreaker"
+	"rag-gateway/internal/coalesce"
 	"rag-gateway/internal/downstream"
 	"rag-gateway/internal/embedding"
 	"rag-gateway/internal/observability"
+	"rag-gateway/internal/vector"
 )
 
 // qaRequest 与 OpenAPI QARequest 对齐。
@@ -87,9 +90,17 @@ func (d *Deps) handleQA(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if d.Embedder != nil {
+	mergeKey := coalesce.Key(body.Scope, body.Query)
+	needEmbed := d.Embedder != nil &&
+		((d.VectorEnabled && d.Vector != nil) ||
+			(d.Downstream != nil && d.Semantic != nil) ||
+			d.DedupWriter != nil ||
+			d.DedupVector != nil)
+
+	var embVec []float64
+	if needEmbed {
 		emb0 := time.Now()
-		_, err := d.Embedder.Embed(r.Context(), embedding.EmbedInput{
+		embRes, err := d.Embedder.Embed(r.Context(), embedding.EmbedInput{
 			Text:    body.Query,
 			TraceID: tid,
 		})
@@ -115,7 +126,83 @@ func (d *Deps) handleQA(w http.ResponseWriter, r *http.Request) {
 			_ = writeSSE(w, "error", string(b))
 			return
 		}
-		// 向量检索（L3）未接库时：嵌入成功后仍可走下游 RAG（NFR-P02 子阶段后续拆分）
+		if embRes != nil && len(embRes.Embedding) > 0 {
+			embVec = embRes.Embedding
+		}
+	}
+
+	if d.VectorEnabled && d.Vector != nil && len(embVec) > 0 {
+		v0 := time.Now()
+		sr, hit, verr := d.Vector.Search(r.Context(), vector.SearchInput{
+			Vector:  embVec,
+			TraceID: tid,
+		})
+		observability.ObserveQAPhase("vector", time.Since(v0))
+		if verr != nil {
+			if errors.Is(verr, circuitbreaker.ErrOpen) {
+				observability.RecordQA("error_vector_circuit")
+				errBody := ErrorBody{
+					Code:    "VECTOR_CIRCUIT_OPEN",
+					Message: "向量检索熔断开路，请稍后重试",
+					TraceID: tid,
+				}
+				b, _ := json.Marshal(errBody)
+				_ = writeSSE(w, "error", string(b))
+				return
+			}
+			log.Printf("向量检索失败，降级走 RAG: traceId=%s err=%v", tid, verr)
+		} else if hit {
+			delta, _ := json.Marshal(map[string]string{"text": sr.Text})
+			if err := writeSSE(w, "delta", string(delta)); err != nil {
+				return
+			}
+			src := "semantic_cache"
+			if sr.HitKind == "dedup" {
+				src = "semantic_dedup"
+			}
+			done, _ := json.Marshal(struct {
+				Source  string `json:"source"`
+				TraceID string `json:"traceId"`
+			}{Source: src, TraceID: tid})
+			_ = writeSSE(w, "done", string(done))
+			observability.RecordQA(src)
+			return
+		}
+	}
+
+	if d.DedupVector != nil && len(embVec) > 0 {
+		d0 := time.Now()
+		sr2, hit2, derr := d.DedupVector.Search(r.Context(), vector.SearchInput{
+			Vector:  embVec,
+			TraceID: tid,
+		})
+		observability.ObserveQAPhase("vector_dedup", time.Since(d0))
+		if derr != nil {
+			if errors.Is(derr, circuitbreaker.ErrOpen) {
+				observability.RecordQA("error_vector_circuit")
+				errBody := ErrorBody{
+					Code:    "VECTOR_CIRCUIT_OPEN",
+					Message: "持久化语义去重检索熔断开路，请稍后重试",
+					TraceID: tid,
+				}
+				b, _ := json.Marshal(errBody)
+				_ = writeSSE(w, "error", string(b))
+				return
+			}
+			log.Printf("持久化语义去重检索失败，降级走 RAG: traceId=%s err=%v", tid, derr)
+		} else if hit2 {
+			delta, _ := json.Marshal(map[string]string{"text": sr2.Text})
+			if err := writeSSE(w, "delta", string(delta)); err != nil {
+				return
+			}
+			done, _ := json.Marshal(struct {
+				Source  string `json:"source"`
+				TraceID string `json:"traceId"`
+			}{Source: "semantic_dedup", TraceID: tid})
+			_ = writeSSE(w, "done", string(done))
+			observability.RecordQA("semantic_dedup")
+			return
+		}
 	}
 
 	if d.Downstream != nil {
@@ -124,11 +211,24 @@ func (d *Deps) handleQA(w http.ResponseWriter, r *http.Request) {
 		if body.SessionID != nil {
 			sid = strings.TrimSpace(*body.SessionID)
 		}
-		text, err := d.Downstream.Complete(r.Context(), downstream.AnswerInput{
-			Query:     body.Query,
-			TraceID:   tid,
-			SessionID: sid,
-		})
+		fn := func(ctx context.Context) (string, error) {
+			return d.Downstream.Complete(ctx, downstream.AnswerInput{
+				Query:     body.Query,
+				TraceID:   tid,
+				SessionID: sid,
+			})
+		}
+		c0 := time.Now()
+		var text string
+		var err error
+		if d.Semantic != nil && len(embVec) > 0 {
+			// 语义相似合并：同 scope 下 embedding 余弦 ≥ 阈值则共用一次 RAG（见 coalesce.Semantic）。
+			text, err = d.Semantic.Merge(r.Context(), mergeKey, embVec, fn)
+		} else {
+			// 文本规范化键合并：同 scope + 规范化 query（coalesce.enabled 时）。
+			text, err = d.Coalesce.Do(r.Context(), mergeKey, fn)
+		}
+		observability.ObserveQAPhase("coalesce", time.Since(c0))
 		if err != nil {
 			observability.RecordQA("error_rag")
 			code := "智能问答失败"
@@ -156,6 +256,21 @@ func (d *Deps) handleQA(w http.ResponseWriter, r *http.Request) {
 		}{Source: "rag", TraceID: tid})
 		_ = writeSSE(w, "done", string(done))
 		observability.RecordQA("rag")
+		if d.DedupWriter != nil && len(embVec) > 0 && strings.TrimSpace(text) != "" {
+			q := body.Query
+			go func(query, answer, trace string, vec []float64) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := d.DedupWriter.WriteAnswer(ctx, vector.WriteAnswerInput{
+					Vector:  vec,
+					Text:    answer,
+					Query:   query,
+					TraceID: trace,
+				}); err != nil {
+					log.Printf("持久化语义去重写回失败 traceId=%s: %v", trace, err)
+				}
+			}(q, text, tid, embVec)
+		}
 		return
 	}
 

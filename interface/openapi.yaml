@@ -8,7 +8,7 @@ info:
     **健康检查** `GET /v1/health`：`application/json`。
     **产品与架构对齐（`interface/PM_PRODUCT_REVIEW.md` §0）**：精确命中 **`scope`+`key`**；**`ErrorBody.code` 中文稳定短语**；**无** `X-Config-Version`，版本走 SSE **`productVersion`**；用户 **仅 SSE**；**缺省 Accept 流类型须 406**。
     本期仅 HTTP；gRPC 北向不纳入本期实现。映射 PRD：`specs/requirements.md`（FR-Uxx、FR-Axx）。
-  version: 0.2.3
+  version: 0.2.4
 
 servers:
   - url: /
@@ -46,7 +46,7 @@ paths:
       tags: [UserQA]
       summary: 用户提问（SSE 流式应答）
       description: |
-        编排顺序由实现遵循架构：精确 → 正则 → 向量语义缓存 → 外部 RAG。
+        编排顺序由实现遵循架构：精确 → 正则 → 向量语义缓存（含可选持久化语义去重命中）→ 外部 RAG。
 
         **传输形态**：成功时响应 `Content-Type: text/event-stream`（[Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)），字符编码 **UTF-8**。  
         客户端须携带 `Accept: text/event-stream`；**否则服务端应返回 406**（产品与架构对齐）。
@@ -510,10 +510,12 @@ components:
         - rule_exact
         - rule_regex
         - semantic_cache
+        - semantic_dedup
         - rag
       description: |
         rule_exact / rule_regex：命中规则库 DAT。
-        semantic_cache：向量语义缓存（L3）命中且未调用外部 RAG。
+        semantic_cache：向量语义缓存（L3）命中且未调用外部 RAG（预置/管理灌库等，非 RAG 写回点）。
+        semantic_dedup：持久化语义去重命中（FR-U04），复用历史 RAG 成功结果，未再次调用外部 RAG。
         rag：由外部知识/模型服务生成（FR-U03）。
 
     SSEMetaData:

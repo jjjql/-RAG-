@@ -26,9 +26,9 @@
 | `internal/rules` + `internal/cache` | 极速拦截 | 精确 O(1) 或等价；正则预编译并按 **priority↓、同 priority 最新更新** 遍历；**精确命中短路**；scope 隔离 | **不得**在命中路径访问 Redis；满足 NFR-P01 |
 | `internal/rulesync` | 热更新 | Redis 存储模型；Pub/Sub 事件；原子替换内存索引；可选全量回源 | 对齐 `.cursorrules` |
 | `internal/embedding` | UDS 客户端 | **严格实现** `specs/architecture/contracts/UDS_EMBEDDING.md`（uint32 BE 长度前缀 + JSON）；**100ms** 级超时；错误分类；连接/池化（避免冷连接放大 P99）；支持 **ping** 就绪探测 | 耗时计入 **NFR-P02**（`SYSTEM_DESIGN.md` §2.3）；载荷校验可对照 `uds_embedding.schema.json` |
-| `internal/vector` | L3 | `VectorStore` 接口；Qdrant 实现；阈值配置；Mock | 检索耗时计入 **NFR-P02**（§2.3）；单测可离线 |
+| `internal/vector` | L3 + FR-U04 | `Store.Search`；**`UpsertWriteAnswer`**（RAG 写回）；`HitKind` 区分 `semantic_cache` / `semantic_dedup`；`TimeoutUpserter`；Mock | 检索耗时计入 **NFR-P02**；见 **`SEMANTIC_DEDUP_PERSISTENT.md`** |
 | `internal/downstream` | 智能问答 | **`mock`** 与 **`langchain_http`**（契约 **`contracts/HTTP_LANGCHAIN_DOWNSTREAM.md` v0.1）；超时；`sessionId`/`traceId` 透传 | 对齐 **FR-U01**、**FR-U03** |
-| `internal/coalesce` | 合并 | 相似 key 定义；等待超时；并发正确性 | 对齐 `.cursorrules` |
+| `internal/coalesce` | 合并 | 文本键 `coalesce.Key`；可选 **`coalesce.semantic`**（同 scope 下 embedding **余弦 ≥ 阈值**）；`local` / `redis`；Leader 清理语义 vec/active | **`COALESCE_DESIGN.md`** |
 | `internal/observability` | 可观测 | trace_id；分阶段耗时；Prometheus 埋点 | 支撑 SYS-PERF 口径拆分 |
 
 ---
@@ -50,3 +50,7 @@
 > - **2026-03-27（@Architect）**：**SYS-FUNC-01 双端确认**：见 **`SYS_FUNC_01_DEV_CONFIRM.md`**。**【请 @Dev_Go 按 §2 自检并回复暗号 → @Reviewer → @QA】**
 > - **2026-03-30（@Architect）**：**SYS-ENG-01 熔断**：`internal/circuitbreaker`；`embedding.CircuitService`、`downstream.WrapAnswerer`；`config.yaml` `circuit_breaker`；**SYS-PERF-02 部分**：`gateway_qa_phase_duration_seconds`（见 **`SYS_OBSERVABILITY_METRICS.md`**）。流水线次序 **2～4、7～9** 已随集成/单测归档。
 > - **2026-03-30（@Architect）**：**FR-A01 闭环**：精确规则 **`PATCH` / `DELETE`**（`internal/rules` + `admin_exact.go`）；追溯 **`FR_A01_EXACT_CRUD.md`**；**`scripts/test_integration.sh`** 已含 FR-A01 段。
+> - **2026-03-30（@Architect）**：**SYS-ENG-01 补全 Go→Qdrant**：`vector.timeout_ms`、`vector.circuit_breaker`；**`internal/vector.CircuitStore`**；**`qa.go`** 串联 Embed→L3→`semantic_cache`/降级 RAG；见 **`SYS_ENG_01_BREAKER.md`**。**【Go 侧已交付，请 @Reviewer 评审】→ @QA 复验次序 7 后签【测试通过】。**
+> - **2026-03-30（@Architect）**：**coalesce 闭环**：`NewHandler` **Coalesce nil→Passthrough**；**`qa` `phase=coalesce`**；**`merged_downstream_test.go`**；**`docker-compose` + `test_integration.sh`** 并行同 query；**`COALESCE_DESIGN.md`** 键与实现对齐。**【请 @QA 跑集成脚本确认】**
+> - **2026-03-31（@Architect）**：**语义 coalesce**：`coalesce.semantic` + `similarity_threshold`（默认 0.95）；**`SemanticLocal` / `SemanticRedis`**；**`qa.go`** 在 `semantic=true` 时 RAG 前强制 embed；单测 **`cosine_test` / `semantic_*_test`**。**【请 @Reviewer 按 `REVIEWER_CHECKLIST_SYS` 检视 → @QA 补跑相关 `go test` / 可选集成】**
+> - **2026-03-31（@Architect）**：**FR-U04 持久化语义去重**：`vector.semantic_dedup`；Qdrant **PUT points** 写回；**`semantic_dedup`** SSE 与指标；PRD/OpenAPI **0.2.4**。**【Go 侧已交付：请 @Reviewer 检视 FR-U04 行 → @QA 按 `SYS_ACCEPTANCE_PIPELINE` §3 第 10 行 + E2E 文档签核】**

@@ -13,7 +13,57 @@ type Config struct {
 	Server     ServerConfig     `mapstructure:"server"`
 	Redis      RedisConfig      `mapstructure:"redis"`
 	Embedding  EmbeddingConfig  `mapstructure:"embedding"`
+	Vector     VectorConfig     `mapstructure:"vector"`
+	Coalesce   CoalesceConfig   `mapstructure:"coalesce"`
 	Downstream DownstreamConfig `mapstructure:"downstream"`
+}
+
+// VectorConfig L3 向量语义缓存（见 specs/architecture/VECTOR_L3.md）。
+type VectorConfig struct {
+	Enabled        bool    `mapstructure:"enabled"`
+	Mode           string  `mapstructure:"mode"` // noop | qdrant
+	ScoreThreshold float64 `mapstructure:"score_threshold"`
+	// TimeoutMS 单次向量检索超时（SYS-ENG-01：Go→Qdrant），默认 100。
+	TimeoutMS int `mapstructure:"timeout_ms"`
+	Qdrant     QdrantConfigYAML `mapstructure:"qdrant"`
+	// SemanticDedup 跨进程持久化语义去重（见 SEMANTIC_DEDUP_PERSISTENT.md）。
+	SemanticDedup SemanticDedupConfig `mapstructure:"semantic_dedup"`
+	// CircuitBreaker 向量检索熔断；见 SYS_ENG_01_BREAKER.md。
+	CircuitBreaker CircuitBreakerConfig `mapstructure:"circuit_breaker"`
+}
+
+// SemanticDedupConfig RAG 成功写回 Qdrant；读可走主集合（payload.source）或独立集合二次检索。
+type SemanticDedupConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Collection 为空：与 qdrant.collection 共用，依赖单次 Search + payload.source=rag_writeback 区分命中来源。
+	// 非空且与主集合不同：L3 miss 后再检索本集合；写回仅写入本集合。
+	Collection string `mapstructure:"collection"`
+	// ScoreThreshold 检索阈值；≤0 时沿用 vector.score_threshold。
+	ScoreThreshold float64 `mapstructure:"score_threshold"`
+}
+
+// QdrantConfigYAML 映射至 vector.QdrantConfig。
+type QdrantConfigYAML struct {
+	URL        string `mapstructure:"url"`
+	Collection string `mapstructure:"collection"`
+	APIKey     string `mapstructure:"api_key"`
+}
+
+// CoalesceConfig 相似请求合并（见 specs/architecture/COALESCE_DESIGN.md）。
+type CoalesceConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// Mode：local（进程内 singleflight）| redis（跨实例，依赖 redis.addr）。
+	Mode string `mapstructure:"mode"`
+	// Semantic 为 true 时，RAG 合并键由「同 scope 下 embedding 余弦相似度 ≥ similarity_threshold」决定（须 embedding.enabled）。
+	Semantic bool `mapstructure:"semantic"`
+	// SimilarityThreshold 余弦相似度下限，默认 0.95；仅在 semantic=true 时生效。
+	SimilarityThreshold float64 `mapstructure:"similarity_threshold"`
+	// SemanticMaxActive 单 scope 下语义合并活跃组上限（redis 模式）；超出则当次请求不再合并。
+	SemanticMaxActive int `mapstructure:"semantic_max_active"`
+	// LockTTLSeconds Redis 占锁秒数，应大于 downstream.timeout_ms。
+	LockTTLSeconds int `mapstructure:"lock_ttl_seconds"`
+	// ResultTTLSeconds 结果键保留秒数，其它网关实例在此期间可读同一次应答。
+	ResultTTLSeconds int `mapstructure:"result_ttl_seconds"`
 }
 
 // CircuitBreakerConfig 熔断（SYS-ENG-01）；Enabled=false 时不包装下游调用。
@@ -45,6 +95,8 @@ type DownstreamConfig struct {
 	Enabled   bool   `mapstructure:"enabled"`
 	Mode      string `mapstructure:"mode"` // mock | langchain_http
 	MockText  string `mapstructure:"mock_text"`
+	// MockDelayMS 仅 mode=mock：Answer 前睡眠毫秒数，用于 SYS-ENG-01 超时/故障注入（生产勿用）。
+	MockDelayMS int `mapstructure:"mock_delay_ms"`
 	TimeoutMS int    `mapstructure:"timeout_ms"`
 	// LangChain 南向 HTTP（见 specs/architecture/contracts/HTTP_LANGCHAIN_DOWNSTREAM.md）
 	HTTPBaseURL      string `mapstructure:"http_base_url"`
@@ -87,7 +139,23 @@ func Load(path string, defaultHTTPAddr string) (*Config, error) {
 	_ = v.BindEnv("downstream.http_base_url", "GATEWAY_DOWNSTREAM_HTTP_BASE_URL")
 	_ = v.BindEnv("downstream.http_path", "GATEWAY_DOWNSTREAM_HTTP_PATH")
 	_ = v.BindEnv("downstream.timeout_ms", "GATEWAY_DOWNSTREAM_TIMEOUT_MS")
+	_ = v.BindEnv("downstream.mock_delay_ms", "GATEWAY_DOWNSTREAM_MOCK_DELAY_MS")
 	_ = v.BindEnv("downstream.http_api_key_header", "GATEWAY_DOWNSTREAM_HTTP_API_KEY_HEADER")
+	_ = v.BindEnv("coalesce.enabled", "GATEWAY_COALESCE_ENABLED")
+	_ = v.BindEnv("coalesce.mode", "GATEWAY_COALESCE_MODE")
+	_ = v.BindEnv("coalesce.semantic", "GATEWAY_COALESCE_SEMANTIC")
+	_ = v.BindEnv("coalesce.similarity_threshold", "GATEWAY_COALESCE_SIMILARITY_THRESHOLD")
+	_ = v.BindEnv("coalesce.semantic_max_active", "GATEWAY_COALESCE_SEMANTIC_MAX_ACTIVE")
+	_ = v.BindEnv("vector.enabled", "GATEWAY_VECTOR_ENABLED")
+	_ = v.BindEnv("vector.mode", "GATEWAY_VECTOR_MODE")
+	_ = v.BindEnv("vector.timeout_ms", "GATEWAY_VECTOR_TIMEOUT_MS")
+	_ = v.BindEnv("vector.score_threshold", "GATEWAY_VECTOR_SCORE_THRESHOLD")
+	_ = v.BindEnv("vector.qdrant.url", "GATEWAY_VECTOR_QDRANT_URL")
+	_ = v.BindEnv("vector.qdrant.collection", "GATEWAY_VECTOR_QDRANT_COLLECTION")
+	_ = v.BindEnv("vector.qdrant.api_key", "GATEWAY_VECTOR_QDRANT_API_KEY")
+	_ = v.BindEnv("vector.semantic_dedup.enabled", "GATEWAY_VECTOR_SEMANTIC_DEDUP_ENABLED")
+	_ = v.BindEnv("vector.semantic_dedup.collection", "GATEWAY_VECTOR_SEMANTIC_DEDUP_COLLECTION")
+	_ = v.BindEnv("vector.semantic_dedup.score_threshold", "GATEWAY_VECTOR_SEMANTIC_DEDUP_SCORE_THRESHOLD")
 
 	v.SetConfigFile(path)
 	v.SetConfigType("yaml")

@@ -184,6 +184,8 @@ flowchart TB
 | SYS-FUNC-03 | FR-U01 + FR-U03 + NFR-G01 | 用户提问未命中规则时，可走智能问答并得到答案；外部服务故障时用户得到明确失败提示（非无限等待） | 下游 RAG **Mock/替身** | **SSE**：`delta` 拼接为答案；`done.source`=`rag`（或经向量缓存时按契约）；故障：`event:error` 或 HTTP 错误体，非无限等待 |
 | SYS-FUNC-05 | NFR-G03 | 规则变更后，在生效窗口外重复同一问题，应答稳定一致（无不可解释抖动） | Redis + 多实例（可选） | 连续 N 次结果一致 |
 
+> **FR-U04（持久化语义去重）**：PRD **`specs/requirements.md`**；设计 **`SEMANTIC_DEDUP_PERSISTENT.md`**；北向 **`done.source`=`semantic_dedup`**（OpenAPI **0.2.4+**）。验收签核见 **`SYS_ACCEPTANCE_PIPELINE.md` §3 第 10 行**（**不占用**上表 SYS-FUNC 序号，避免与原 SYS-FUNC-04 移除项混淆）。
+
 > **说明（鉴权裁剪）**：原 **SYS-FUNC-04（NFR-G02 管理端鉴权）** 已从**本期系统设计验收表**移除：**网关不实现**管理端 401/403 凭证校验；**NFR-G02** 仍保留在 PRD，由**部署层**（网络隔离、前置网关、mTLS 等）落实。若产品要求**网关进程内**强制鉴权，须单独立项并回写 OpenAPI / 本表。
 
 ### 3.2 专项性能类（SYS-PERF）
@@ -265,13 +267,13 @@ flowchart TB
 | **指标命名与 label 未规范** | Prometheus 抓取后无法跨环境对比 P99、无法按阶段分解 | 输出「观测字典」：例如 `gateway_request_duration_seconds` 的 stage、`outcome`、`route` 等枚举。 |
 | **FR-A03「约定时间」** | PRD 已写 **1 秒内**生效（`requirements.md`）；与 SYS-FUNC 一致 | 若变更窗口需同步改 PRD 与集成测试断言。 |
 | **北向协议** | **本期已定 HTTP**（§5.2）；压测与 trace 以 `interface/openapi.yaml` 为准 | gRPC 不作为本期交付。 |
-| **相似请求合并键定义** | coalesce 行为难以写确定性单测/集成测 | 在契约或 `internal/coalesce` 设计说明中写死「相似」的规范化规则（如规范化 query + scope）。 |
+| **相似请求合并键定义** | （已落盘） | 见 **`COALESCE_DESIGN.md`** 与 `coalesce.Key`；集成脚本含并行同 query 段。 |
 
 ### 6.4 开发前提条件 READY 矩阵（与 @Dev_Go、@Dev_Python 对齐）
 
 > 下表用于两位开发**同步认知**：哪些已 READY、哪些仍属**黄灯**（可开工但后续要返工/补文档）。**UDS Embedding** 以 `contracts/` 为事实来源后，由架构师按文末暗号派发双端实现。
 
-**总判词**：**可以启动开发（建议仍按 §6.1 两阶段）**；**「前提条件完全 READY（零返工风险）」尚未成立**——**UDS 内部契约已 v1.0 冻结并归档**；北向 HTTP 见 **`interface/openapi.yaml`** 与 **`PM_PRODUCT_REVIEW.md`**；**观测指标字典未落盘**、**coalesce 相似键未写死**。
+**总判词**：**可以启动开发（建议仍按 §6.1 两阶段）**；**「前提条件完全 READY（零返工风险）」尚未成立**——**UDS 内部契约已 v1.0 冻结并归档**；北向 HTTP 见 **`interface/openapi.yaml`** 与 **`PM_PRODUCT_REVIEW.md`**；**观测指标字典未全量落盘**（**coalesce** 已有 `phase=coalesce` 子阶段，见 **`SYS_OBSERVABILITY_METRICS.md`**）。
 
 | 前提项 | 状态 | 说明 |
 |---|---|---|
@@ -280,7 +282,7 @@ flowchart TB
 | 北向契约（`interface/openapi.yaml` + `EXAMPLES.md`） | **黄灯** | **技术已可照着写**；**产品未走完** `PM_PRODUCT_REVIEW.md` 前，`info.version` 视为草案，字段/406/双形态等仍可能变 |
 | Go↔Python **UDS**（Embedding） | **READY（v1.0 冻结，已归档）** | 事实来源：`contracts/UDS_EMBEDDING.md` + `uds_embedding.schema.json`；留痕 **`UDS_INTERNAL_ALIGNMENT.md`**；变更走 **§9.2** |
 | Prometheus **指标名 + label 字典** | **未 READY** | 不阻塞写代码，阻塞 **SYS-ENG-02 / SYS-PERF** 的自动化对齐 |
-| **coalesce**「相似」规范化规则 | **未 READY** | 不阻塞主链路骨架，阻塞合并逻辑的单测/确定性验收 |
+| **coalesce**「相似」规范化规则 | **READY** | 见 **`COALESCE_DESIGN.md`**、`internal/coalesce` 单测与 **`scripts/test_integration.sh`** |
 | 下游 RAG **Mock 接口形状** | **黄灯** | `.cursorrules` 已要求可 Mock；建议在 `internal/downstream` 设计说明或接口文件中写死最小方法集 |
 
 **@Dev_Go（`internal/`）**：配置/bootstrap、`config`、管理端对接 OpenAPI、**SSE** 按 **`interface/openapi.yaml`**、**`internal/embedding` 按已冻结 `contracts/UDS_EMBEDDING.md`（v1.0）**；联调 PR 补 **`UDS_INTERNAL_ALIGNMENT.md` §1** 勾选。  

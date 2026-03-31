@@ -18,6 +18,9 @@ services:
       - "8080:8080"
     environment:
       GATEWAY_REDIS_ADDR: redis:6379
+      # 相似请求合并（coalesce）：集成脚本并行同 query 段依赖此项
+      GATEWAY_COALESCE_ENABLED: "true"
+      GATEWAY_COALESCE_MODE: "local"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     command: ["-config", "/app/config.yaml"]

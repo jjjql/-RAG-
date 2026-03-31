@@ -22,7 +22,7 @@ func init() {
 	qaPhaseSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "gateway",
 		Name:      "qa_phase_duration_seconds",
-		Help:      "POST /v1/qa 分阶段耗时（秒）；embed=单次嵌入；rag_prep=进入 handler 至调用下游前（SYSTEM_DESIGN §2.3 / SYS_OBSERVABILITY_METRICS.md）",
+		Help:      "POST /v1/qa 分阶段耗时（秒）；embed/vector/rag_prep/coalesce 见 SYS_OBSERVABILITY_METRICS.md",
 		Buckets:   buckets,
 	}, []string{"phase"})
 	prometheus.MustRegister(qaCompleted)
@@ -37,7 +37,7 @@ func RecordQA(source string) {
 	qaCompleted.WithLabelValues(source).Inc()
 }
 
-// ObserveQAPhase 记录分阶段耗时（phase：embed、rag_prep）。
+// ObserveQAPhase 记录分阶段耗时（phase：embed、vector、rag_prep、coalesce 等）。
 func ObserveQAPhase(phase string, d time.Duration) {
 	if phase == "" {
 		phase = "unknown"

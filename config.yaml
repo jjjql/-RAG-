@@ -21,12 +21,47 @@ embedding:
     failure_threshold: 5
     open_seconds: 30
 
+# L3 向量语义缓存（Qdrant）；未启用时不走向量。SYS-ENG-01：timeout_ms + circuit_breaker
+vector:
+  enabled: false
+  mode: noop
+  timeout_ms: 100
+  score_threshold: 0.85
+  qdrant:
+    url: ""
+    collection: ""
+    api_key: ""
+  # 持久化长期语义去重（Qdrant）：RAG 成功后写回；命中则 SSE source=semantic_dedup。须 embedding + vector.mode=qdrant。
+  # collection 为空：与 qdrant.collection 共用（单次 L3 Search；写回点 payload.source=rag_writeback）。
+  # collection 非空且与主集合不同：L3 miss 后再搜本集合；写回写入本集合。
+  semantic_dedup:
+    enabled: false
+    collection: ""
+    score_threshold: 0
+  circuit_breaker:
+    enabled: false
+    failure_threshold: 5
+    open_seconds: 30
+
+# 相似请求合并：默认「同 scope + 规范化 query」；semantic=true 时为「同 scope 下 query 向量余弦 ≥ similarity_threshold」。
+# semantic=true 时必须 embedding.enabled（侧车）。mode: local | redis（跨实例见 COALESCE_DESIGN.md）。
+coalesce:
+  enabled: false
+  mode: local
+  semantic: false
+  similarity_threshold: 0.95
+  semantic_max_active: 256
+  lock_ttl_seconds: 120
+  result_ttl_seconds: 90
+
 # 智能问答下游（FR-U01/FR-U03）。mode: mock | langchain_http
 # LangChain 契约：specs/architecture/contracts/HTTP_LANGCHAIN_DOWNSTREAM.md
 downstream:
   enabled: true
   mode: mock
   mock_text: "Mock RAG 应答（集成测试）"
+  # mock_delay_ms：仅 mock；>0 时 Answer 前睡眠，用于 SYS-ENG-01 超时验收（默认 0）
+  mock_delay_ms: 0
   timeout_ms: 100
   circuit_breaker:
     enabled: true

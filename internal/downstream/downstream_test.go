@@ -29,7 +29,8 @@ func TestClient_Complete_Timeout(t *testing.T) {
 	m := &Mock{Text: "x", Delay: 500 * time.Millisecond}
 	c := &Client{A: m, Timeout: 20 * time.Millisecond}
 	_, err := c.Complete(context.Background(), AnswerInput{Query: "q"})
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestMock_DefaultText(t *testing.T) {
